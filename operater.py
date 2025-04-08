@@ -1,9 +1,7 @@
 import os
 import yt_dlp
-import re
 import subprocess
 import json
-import shutil
 from typing import List
 from youtube_transcript_api import YouTubeTranscriptApi
 from langchain_openai import ChatOpenAI
@@ -15,34 +13,20 @@ from langchain_community.chat_models import ChatOpenAI
 from langchain_core.output_parsers import JsonOutputParser
 import streamlit as st
 from dotenv import load_dotenv, find_dotenv
+from pytube import YouTube
+import streamlit.components.v1 as components
 
 # 환경 변수 불러오기
 load_dotenv(find_dotenv())
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-# 폴더 구조 설정
-BASE_DIR = "youtube_summarizer"
-DOWNLOADS_DIR = os.path.join(BASE_DIR, "downloaded_videos")
-GENERATED_DIR = os.path.join(BASE_DIR, "generated_clips")
-
-# 필요한 디렉토리 생성
-def create_directories():
-    os.makedirs(BASE_DIR, exist_ok=True)
-    os.makedirs(DOWNLOADS_DIR, exist_ok=True)
-    os.makedirs(GENERATED_DIR, exist_ok=True)
-
-# 비디오 ID로 작업 디렉토리 생성
-def create_video_directories(video_id):
-    video_dir = os.path.join(GENERATED_DIR, video_id)
-    os.makedirs(video_dir, exist_ok=True)
-    return video_dir
 
 
 # 유튜브 자막 가져오기 함수
 def get_transcript(video_id):
     try:
         transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ko', 'en'])
-        transcript_text = ' '.join([item['text'] for item in transcript_list])
+        # 시작 시간과 지속 시간 정보를를 포함
+        transcript_text = ' '.join([f"[{item['start']}초~{item['start']+item['duration']}초] {item['text']}" for item in transcript_list])
         return transcript_text
     except Exception as e:
         print(f"자막 가져오기 오류: {e}")
@@ -93,13 +77,22 @@ def classify_video_type(transcript):
         # 기본값으로 강의 유형 반환
         return "lecture"
 
+
+
 # 강의 유형을 위한 프롬프트 템플릿
-lecture_prompt_template = """다음은 유튜브 동영상의 전체 자막입니다. 이 자막에서 전체 내용을 이해하는 데 **핵심적인 문맥이나 논리 흐름을 포함하는 전체의 10% 이내의 구간**만을 추출해주세요. 
+lecture_prompt_template = """다음은 유튜브 동영상의 전체 자막이야.
+요약 영상 및 자막은 전체 영상길이의 20%를 넘지 않아야 해,
 
-- 반복되거나 의미가 중복되는 부분은 제외해주세요.
-- 전체 내용의 흐름이 자연스럽게 이어질 수 있도록 핵심 구간을 선택해주세요.
-- 가능한 한 요약에 필요한 정보만 포함하고, 불필요한 잡담, 인사말, 예시 반복은 생략해주세요.
-
+요약할 때는 다음 기준을 따르세요:
+- 각 전환점을 기준으로 핵심 내용과 주요 이슈를 골라 요약해.
+- 핵심 문맥은 영상에서 가장 중요한 메시지와 정보, 그리고 논리 흐름을 유지하는 문장들이야.
+- 가능한 한 요약에 필요한 정보만 포함하고, 불필요한 잡담, 인사말, 예시 반복은 생략해줘.
+- 데이터는 유튜브 자막으로, 타임스탬프가 포함되어 있어.
+- 원하는 요청사항: 이 전체 자막을 20% 이내 분량으로 줄이고 싶어.
+- 필요한 내용들의 타임스탬프만 추출하여, 그 총합이 전체 영상 길이의 20%를 넘지 않아야 해.
+- 연속적인 구간끼리 자연스럽게 묶을 수 있지만, 개별 구간에 중요한 내용이 있다면 반드시 묶어야 하는 것은 아니야. 
+각 구간이 개별적으로 중요한 경우 그대로 선택할 수 있도록 유연하게 고려해.
+- 추출된 구간들은 자연스럽게 이어지는 흐름으로 표시해야 해.
 
 응답은 다음 JSON 형식으로 제공해주세요:
 {{
@@ -120,6 +113,7 @@ lecture_prompt_template = """다음은 유튜브 동영상의 전체 자막입�
 
 다음은 분석할 강의 자막입니다:
 {transcript}"""
+
 
 # 스토리텔링 유형 영상을 위한 프롬프트 템플릿
 storytelling_prompt_template = """다음은 유튜브 동영상의 전체 자막입니다. 이 자막에서 전체 내용을 이해하는 데 **핵심적인 문맥이나 논리 흐름을 포함하는 전체의 10% 이내의 구간**만을 추출해주세요. 
@@ -149,6 +143,7 @@ storytelling_prompt_template = """다음은 유튜브 동영상의 전체 자막
 다음은 분석할 스토리텔링 영상의 자막입니다:
 {transcript}"""
 
+
 # 비디오 세그먼트를 위한 데이터 모델 정의
 class Segment(BaseModel):
     start_time: float = Field(description="세그먼트 시작 시간(초)")
@@ -157,12 +152,14 @@ class Segment(BaseModel):
     description: str = Field(description="이 세그먼트를 바이럴로 만들기 위한 상세 설명")
     duration: float = Field(description="세그먼트 길이(초)")  # int에서 float로 변경
 
+
 # 유튜브 자막 요약 함수
 def summarize_transcript(transcript, video_id, summary_ratio=None, segment_count=None):
     try:
         # 영상 유형 분류
         video_type = classify_video_type(transcript)
-        
+        print(f"{video_type=}")
+
         # 프롬프트에 추가할 요구사항 생성
         additional_requirements = ""
         if summary_ratio is not None:
@@ -207,26 +204,17 @@ def summarize_transcript(transcript, video_id, summary_ratio=None, segment_count
             # JSON 파싱
             parsed_data = json.loads(json_str)
             segments_data = parsed_data.get('segments', [])
-            
-            # 비디오 디렉토리 경로
-            video_dir = os.path.join(GENERATED_DIR, video_id)
-            
-            # 세그먼트 정보 저장
-            segments_json_path = os.path.join(video_dir, f"{video_id}_segments.json")
-            with open(segments_json_path, 'w', encoding='utf-8') as f:
-                json.dump(parsed_data, f, ensure_ascii=False, indent=2)
-            
+              
             # Segment 객체 리스트로 변환
             segments = []
             for item in segments_data:
-                # 종료 시간에만 버퍼 추가
                 segment = Segment(
                     start_time=item["start_time"],
-                    end_time=item["end_time"] + 0.5,
+                    end_time=item["end_time"],
                     yt_title=item["yt_title"],
                     description=item["description"],
-                    duration=float(item["duration"]) + 0.5 if isinstance(item["duration"], (int, float)) else 
-                              float(item["end_time"] - item["start_time"]) + 0.5
+                    duration=float(item["duration"]) if isinstance(item["duration"], (int, float)) else 
+                              float(item["end_time"] - item["start_time"])
                 )
                 segments.append(segment)
             
@@ -248,8 +236,24 @@ def summarize_transcript(transcript, video_id, summary_ratio=None, segment_count
     except Exception as e:
         print(f"영상 유형 분류 오류: {e}")
         return []
+    
 
-
+def get_video_duration(url):
+    try:
+        ydl_opts = {
+            'quiet': True,
+            'extract_flat': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            duration = info.get('duration', 0)  # 영상 길이(초)
+            if duration == 0:
+                print("영상 길이를 가져올 수 없습니다.")
+                return None
+            return duration
+    except Exception as e:
+        print(f"영상 정보 가져오기 오류: {e}")
+        return None
 
 
 # 메인 함수
@@ -259,44 +263,22 @@ def main():
     # CSS 스타일 적용
     st.markdown("""
         <style>
-        .main {
-            background-color: #f5f5f5;
-        }
-        .stApp {
-            max-width: 800px;  # 최대 너비를 800px로 제한
-            margin: 0 auto;
-        }
-        h1 {
-            color: #1e3a8a;
-            font-size: 2.5rem;
-            margin-bottom: 1rem;
-        }
-        .stButton>button {
-            background-color: #1e3a8a;
-            color: white;
-            border-radius: 5px;
-            padding: 0.5rem 1rem;
-            font-weight: bold;
-        }
-        .stButton>button:hover {
-            background-color: #3b5cb8;
-        }
-        .solution-box {
-            background-color: #e6f3ff;
-            padding: 1rem;
-            border-radius: 5px;
-            margin-top: 1rem;
-            border-left: 5px solid #1e3a8a;
-        }
-        .stTextArea>div>div>textarea {
-            background-color: #f9f9f9;
-            border: 1px solid #ddd;
-        }
-        .block-container {
-            max-width: 800px;  # 컨테이너 최대 너비도 제한
-            padding-left: 2rem;
-            padding-right: 2rem;
-        }
+            .stTextArea textarea {
+                background-color: white;
+                font-size: 16px;
+                line-height: 1.5;
+            }
+            .solution-box {
+                background-color: #f8f9fa;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                padding: 10px;
+                font-size: 16px;
+                line-height: 1.5;
+                color: black;
+                max-height: 300px; /* 최대 높이 설정 */
+                overflow-y: auto; /* 스크롤 추가 */
+            }
         </style>
         """, unsafe_allow_html=True)
 
@@ -337,62 +319,17 @@ def main():
     if st.button("Start"):
         with st.spinner("now generating..."):
             try:
-                # 필요한 디렉토리 생성
-                create_directories()
-                
                 # YouTube URL에서 비디오 ID 추출
                 if "youtube.com" in subject or "youtu.be" in subject:
-                    try:
-                        # URL에서 비디오 ID 추출
-                        if "youtube.com" in subject:
-                            video_id = subject.split("v=")[1].split("&")[0] if "v=" in subject else None
-                        else:  # youtu.be 형식
-                            video_id = subject.split("/")[-1].split("?")[0]
-                        
-                        if not video_id:
-                            st.error("YouTube 비디오 ID를 추출할 수 없습니다.")
-                            return
-                        
-                        # 비디오 디렉토리 생성
-                        video_dir = create_video_directories(video_id)
-                        
-                       
-                        # 이미 처리된 영상인지 확인
-                        video_path = os.path.join(DOWNLOADS_DIR, f"{video_id}.mp4")
-                        summary_path = os.path.join(video_dir, f"{video_id}_summary.mp4")
-                        segments_json = os.path.join(video_dir, f"{video_id}_segments.json")
-
-                        # 영상 다운로드 (이미 다운로드된 경우 스킵)
-                        if not os.path.exists(video_path):
-                            # yt-dlp 옵션 설정
-                            ydl_opts = {
-                                'format': 'best',
-                                'outtmpl': os.path.join(DOWNLOADS_DIR, '%(id)s.%(ext)s'),
-                                'socket_timeout': 60,
-                                'retries': 10,
-                                'fragment_retries': 10,
-                                'skip_unavailable_fragments': True,
-                            }
-                            
-                            # yt-dlp를 사용하여 영상 다운로드
-                            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                                info_dict = ydl.extract_info(subject, download=True)
-                                ext = info_dict.get('ext', 'mp4')
-                                video_path = os.path.join(DOWNLOADS_DIR, f"{video_id}.{ext}")
-                                st.success(f"영상 다운로드 완료: {video_id}")
-                        else:
-                            st.info(f"이미 다운로드된 영상을 사용합니다: {video_id}")
-                        
-                    except Exception as e:
-                        st.warning(f"비디오 다운로드 실패: {e}. 자막만 처리합니다.")
-                        if "youtube.com" in subject:
-                            video_id = subject.split("v=")[1].split("&")[0]
-                        else:  # youtu.be 형식
-                            video_id = subject.split("/")[-1].split("?")[0]
-                        video_path = None
-                        
-                        # 비디오 디렉토리 생성
-                        video_dir = create_video_directories(video_id)
+                    # URL에서 비디오 ID 추출
+                    if "youtube.com" in subject:
+                        video_id = subject.split("v=")[1].split("&")[0] if "v=" in subject else None
+                    else:  # youtu.be 형식
+                        video_id = subject.split("/")[-1].split("?")[0]
+                    
+                    if not video_id:
+                        st.error("YouTube 비디오 ID를 추출할 수 없습니다.")
+                        return
                     
                     # 자막 가져오기
                     transcript = get_transcript(video_id)
@@ -408,95 +345,138 @@ def main():
                         st.error("세그먼트를 추출할 수 없습니다.")
                         return
                     
-                    # 세그먼트 정보를 JSON으로 저장
-                    segments_data = {
-                        "segments": [
-                            {
-                                "start_time": segment.start_time,
-                                "end_time": segment.end_time,
+                    # 원본 영상 길이 불러오기
+                    video_duration = get_video_duration(subject)
+                    
+                    if video_duration is None:
+                        st.error("영상 길이를 가져올 수 없습니다.")
+                        return
+                    
+                    st.info(f"영상 길이: {video_duration}초")
+                    
+                    # 유효한 세그먼트만 필터링하고 딕셔너리로 변환
+                    filtered_segments = []
+                    for segment in segments:
+                        start_time = min(segment.start_time, video_duration - 1)
+                        end_time = min(segment.end_time, video_duration)
+                        if start_time < end_time:
+                            filtered_segments.append({
+                                "start_time": start_time,
+                                "end_time": end_time,
                                 "yt_title": segment.yt_title,
                                 "description": segment.description,
                                 "duration": segment.duration
-                            } for segment in segments
-                        ]
-                    }
+                            })
                     
-                    # JSON 파일로 저장
-                    with open(segments_json, 'w', encoding='utf-8') as f:
-                        json.dump(segments_data, f, ensure_ascii=False, indent=4)
+                    # 세그먼트 정보를 JSON으로 변환
+                    segments_json = json.dumps(filtered_segments)
                     
-                    # 다운로드 성공 여부에 따라 다른 처리
-                    if video_path and os.path.exists(video_path):
-                        # 클립 목록을 저장할 텍스트 파일 경로
-                        concat_txt_path = os.path.join(video_dir, f"{video_id}_concat.txt")
+                    if filtered_segments:    
+                        # YouTube 플레이어와 컨트롤러 HTML 생성
+                        player_html = f"""
+                        <div style="margin-bottom: 20px;">
+                          <iframe
+                            id="player"
+                            width="100%"
+                            height="400"
+                            src="https://www.youtube.com/embed/{video_id}?enablejsapi=1"
+                            frameborder="0"
+                            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope"
+                            allowfullscreen
+                          ></iframe>
+                        </div>
+
+                        <script src="https://www.youtube.com/iframe_api"></script>
+                        <script>
+                          const segments = {segments_json};
+                          let currentSegment = 0;
+                          let player;
+
+                          // YouTube API가 준비되면 호출되는 함수
+                          function onYouTubeIframeAPIReady() {{
+                              player = new YT.Player('player', {{
+                                  events: {{
+                                      'onReady': onPlayerReady,
+                                      'onStateChange': onPlayerStateChange
+                                  }}
+                              }});
+                          }}
+
+                          // 플레이어가 준비되면 호출되는 함수
+                          function onPlayerReady(event) {{
+                              playNextSegment();
+                          }}
+
+                          // 플레이어 상태가 변경될 때 호출되는 함수
+                          function onPlayerStateChange(event) {{
+                              // 현재 세그먼트가 끝나면 다음 세그먼트로 이동
+                              if (event.data === YT.PlayerState.PLAYING) {{
+                                  const segment = segments[currentSegment];
+                                  const duration = (segment.end_time - segment.start_time) * 1000;
+                                  setTimeout(() => {{
+                                      if (currentSegment < segments.length - 1) {{
+                                          currentSegment++;
+                                          playNextSegment();
+                                      }}
+                                  }}, duration);
+                              }}
+                          }}
+
+                          function playNextSegment() {{
+                              if (currentSegment >= segments.length) return;
+                              
+                              const segment = segments[currentSegment];
+                              player.seekTo(segment.start_time);
+                              player.playVideo();
+                          }}
+
+                          // 이전 세그먼트 재생 버튼
+                          function playPreviousSegment() {{
+                              if (currentSegment > 0) {{
+                                  currentSegment--;
+                                  playNextSegment();
+                              }}
+                          }}
+
+                          // 다음 세그먼트 재생 버튼
+                          function playForwardSegment() {{
+                              if (currentSegment < segments.length - 1) {{
+                                  currentSegment++;  // 먼저 인덱스를 증가
+                                  playNextSegment();
+                              }}
+                          }}
+
+                          // 컨트롤 버튼 추가
+                          document.write(`
+                              <div style="margin-top: 10px; text-align: center;">
+                                  <button onclick="playPreviousSegment()" style="margin: 5px;">이전 세그먼트</button>
+                                  <button onclick="playForwardSegment()" style="margin: 5px;">다음 세그먼트</button>
+                              </div>
+                          `);
+                        </script>
+                        """
                         
-                        # 클립 목록 파일 생성
-                        with open(concat_txt_path, "w", encoding="utf-8") as f:
-                            for i, segment in enumerate(segments):
-                                # 클립 파일 경로
-                                clip_path = os.path.join(video_dir, f"{video_id}_clip_{i+1}.mp4")
-                                
-                                # 세그먼트 라벨 파일 경로
-                                label_path = os.path.join(video_dir, f"{video_id}_label_{i+1}.txt")
-                                
-                                # 세그먼트 라벨 저장
-                                with open(label_path, "w", encoding="utf-8") as label_file:
-                                    label_file.write(f"제목: {segment.yt_title}\n")
-                                    label_file.write(f"설명: {segment.description}\n")
-                                    label_file.write(f"시간: {segment.start_time}초 ~ {segment.end_time}초\n")
-                                    label_file.write(f"길이: {segment.duration}초\n")
-                                
-                                # 시작 및 종료 시간
-                                start_time = segment.start_time
-                                end_time = segment.end_time
-                                
-                                # FFmpeg를 사용하여 클립 추출
-                                clip_command = f'ffmpeg -y -ss {start_time} -to {end_time} -i "{video_path}" -c:v libx264 -c:a aac -avoid_negative_ts 1 "{clip_path}"'
-                                
-                                try:
-                                    subprocess.run(clip_command, shell=True, check=True)
-                                    # 클립 파일 경로를 concat 파일에 추가 - 상대 경로 사용
-                                    # 중요: 여기서 절대 경로가 아닌 상대 경로를 사용해야 함
-                                    f.write(f"file '{os.path.basename(clip_path)}'\n")
-                                except subprocess.CalledProcessError as e:
-                                    st.error(f"클립 추출 오류: {e}")
-                        
-                        # FFmpeg를 사용하여 클립 병합
-                        merge_command = f'ffmpeg -y -f concat -safe 0 -i "{concat_txt_path}" -c copy "{summary_path}"'
-                        
-                        try:
-                            subprocess.run(merge_command, shell=True, check=True)
-                            st.success(f"클립 병합 완료: {summary_path}")
-                            
-                            # 결과 표시
-                            st.markdown("### 생성된 영상")
-                            st.video(summary_path)
-                            
-                            # 세그먼트 정보 표시
-                            st.markdown("### 세그먼트 정보")
+                        # 세그먼트 정보 표시
+                        st.markdown("### 세그먼트 정보")
+                        with st.expander("📋 세그먼트 정보 보기"):
                             for i, segment in enumerate(segments):
                                 st.markdown(f"**세그먼트 {i+1}**: {segment.yt_title}")
                                 st.markdown(f"시간: {segment.start_time}초 ~ {segment.end_time}초")
                                 st.markdown(f"설명: {segment.description}")
                                 st.markdown(f"길이: {segment.duration}초")
                                 st.markdown("---")
-                            
-                            st.markdown(f"<div class='solution-box'>영상 저장 경로: {summary_path}</div>", unsafe_allow_html=True)
-                            st.write("※본 영상은 AI에 의해 편집된 요약 영상이며, 부정확할 수도 있습니다. 참고용으로 사용해주세요.")
-                            print("영상 저장이 완료되었습니다.")
-                        except subprocess.CalledProcessError as e:
-                            st.error(f"클립 병합 오류: {e}")
+                        
+                        # YouTube 플레이어 삽입
+                        components.html(player_html, height=500)
+                        
+                        st.write("※본 영상은 AI에 의해 편집된 요약 영상이며, 부정확할 수도 있습니다. 참고용으로 사용해주세요.")
+                        
                     else:
-                        # 다운로드 실패 시 자막 요약만 표시
-                        st.markdown("### 자막 요약 결과")
-                        for i, segment in enumerate(segments):
-                            st.markdown(f"**세그먼트 {i+1}**: {segment.yt_title}")
-                            st.markdown(f"시간: {segment.start_time}초 ~ {segment.end_time}초")
-                            st.markdown(f"설명: {segment.description}")
-                            st.markdown(f"길이: {segment.duration}초")
-                            st.markdown("---")
+                        st.error("세그먼트를 추출할 수 없습니다.")
+                        
                 else:
                     st.error("유효한 YouTube URL을 입력해주세요.")
+                    
             except Exception as e:
                 st.error(f"오류가 발생했습니다: {e}")
 
